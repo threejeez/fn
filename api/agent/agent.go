@@ -113,12 +113,38 @@ type agent struct {
 	// TODO(reed): shoot this fucking thing
 	callOverrider CallOverrider
 
+	// Call Extension interceptor
+	extensionInterceptor ExtensionInterceptor
+
 	// additional options to configure each call
 	callOpts []CallOpt
 
 	// deferred actions to call at end of initialisation
 	onStartup []func()
 }
+
+type ExtensionInterceptor interface {
+	// BeforeCreate is triggered immediately preceding container creation, after all other
+	// configuration is in place.
+	// ContainerTask.Id() can be used to provide a stable per-container key.
+	BeforeCreate(context.Context, drivers.ContainerTask, drivers.Cookie, Call) error
+
+	// AfterDestroy is triggered immediately after container shutdown.
+	// ContainerTask.Id() can be used to provide a stable per-container key.
+	AfterDestroy(context.Context, drivers.ContainerTask) error
+
+	// BeforeCall is triggered immediately preceding call invocation.
+	// ContainerTask.Id() can be used to provide a stable per-container key that corresponds
+	// to the Id seen by BeforeCreate/AfterDestroy.
+	BeforeCall(context.Context, drivers.ContainerTask, Call, CallExtensions) error
+
+	// AfterCall is triggered immediately after an invocation, to tidy up any per-invocation state.
+	// ContainerTask.Id() can be used to provide a stable per-container key that corresponds
+	// to the Id seen by BeforeCreate/AfterDestroy.
+	AfterCall(context.Context, drivers.ContainerTask, Call, CallExtensions) error
+}
+
+type CallExtensions = map[string]string
 
 // Option configures an agent at startup
 type Option func(*agent) error
@@ -228,6 +254,15 @@ func WithCallOptions(opts ...CallOpt) Option {
 	}
 }
 
+// WithExtensionInterceptor attaches a low-level interceptor to the agent that can modify the
+// container definition prior to creation, and tap into call Extension metadata prior to each call
+func WithExtensionInterceptor(extn ExtensionInterceptor) Option {
+	return func(a *agent) error {
+		a.extensionInterceptor = extn
+		return nil
+	}
+}
+
 // NewDockerDriver creates a default docker driver from agent config
 func NewDockerDriver(cfg *Config) (drivers.Driver, error) {
 	return drivers.New("docker", drivers.Config{
@@ -305,6 +340,15 @@ func (a *agent) submit(ctx context.Context, call *call) error {
 		return a.handleCallEnd(ctx, call, slot, err, false)
 	}
 
+	// Wrap a BeforeCall/AfterCall extension around the execution.
+	// we need this because we want access to the call Extension metadata
+	if s := slot.(*hotSlot); s != nil && a.extensionInterceptor != nil {
+		err = a.extensionInterceptor.BeforeCall(ctx, s.container, call, call.extensions)
+		if err != nil {
+			return a.handleCallEnd(ctx, call, slot, err, false)
+		}
+	}
+
 	statsDequeue(ctx)
 	statsStartRun(ctx)
 
@@ -314,6 +358,15 @@ func (a *agent) submit(ctx context.Context, call *call) error {
 
 	// Pass this error (nil or otherwise) to end directly, to store status, etc.
 	err = slot.exec(slotCtx, call)
+
+	// Extension AfterCall
+	if s := slot.(*hotSlot); s != nil && a.extensionInterceptor != nil {
+		err2 := a.extensionInterceptor.AfterCall(ctx, s.container, call, call.extensions)
+		if err == nil {
+			err = err2
+		}
+	}
+
 	return a.handleCallEnd(ctx, call, slot, err, true)
 }
 
@@ -793,6 +846,7 @@ func (a *agent) runHot(ctx context.Context, caller slotCaller, call *call, tok R
 	var container *container
 	var cookie drivers.Cookie
 	var err error
+	var extensionRan bool
 
 	id := id.New().String()
 	logger := logrus.WithFields(logrus.Fields{"id": id, "app_id": call.AppID, "fn_id": call.FnID, "image": call.Image, "memory": call.Memory, "cpus": call.CPUs, "idle_timeout": call.IdleTimeout})
@@ -835,6 +889,12 @@ func (a *agent) runHot(ctx context.Context, caller slotCaller, call *call, tok R
 			container.Close()
 		}
 
+		// If the BeforeCreate executed, we must call the ExceptionInterceptor AfterDestroy in order
+		// that any resources created are tidied up.
+		if a.extensionInterceptor != nil && extensionRan {
+			a.extensionInterceptor.AfterDestroy(common.BackgroundContext(ctx), container)
+		}
+
 		tok.Close() // release cpu/mem
 
 		state.UpdateState(ctx, ContainerStateDone, call)
@@ -870,6 +930,16 @@ func (a *agent) runHot(ctx context.Context, caller slotCaller, call *call, tok R
 	cookie, err = a.driver.CreateCookie(ctx, container)
 	if tryQueueErr(err, errQueue) != nil {
 		return
+	}
+
+	// Wrap an ExtensionInterceptor BeforeCreate/AfterDestroy around here
+	// This can modify the cookie directly if required
+	if a.extensionInterceptor != nil {
+		err = a.extensionInterceptor.BeforeCreate(ctx, container, cookie, call)
+		if tryQueueErr(err, errQueue) != nil {
+			return
+		}
+		extensionRan = true
 	}
 
 	needsPull, err := cookie.ValidateImage(ctx)
